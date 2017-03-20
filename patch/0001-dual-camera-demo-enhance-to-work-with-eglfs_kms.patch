@@ -1,0 +1,429 @@
+From 5d2bf485c5fd9047e7150919d6d252190188ab88 Mon Sep 17 00:00:00 2001
+From: Eric Ruei <e-ruei1@ti.com>
+Date: Fri, 28 Oct 2016 15:45:37 -0400
+Subject: [PATCH] dual-camera-demo: enhance to work with eglfs_kms
+
+Signed-off-by: Eric Ruei <e-ruei1@ti.com>
+---
+ dual_camera.pro |   2 +-
+ loopback.c      | 216 +++++++++++++++++++++++++++++++++++++-------------------
+ loopback.h      |  14 ++++
+ main.cpp        |   3 +-
+ mainwindow.cpp  |   9 ++-
+ mainwindow.h    |   4 +-
+ 6 files changed, 169 insertions(+), 79 deletions(-)
+ mode change 100644 => 100755 dual_camera.pro
+ mode change 100644 => 100755 loopback.c
+
+diff --git a/dual_camera.pro b/dual_camera.pro
+old mode 100644
+new mode 100755
+index 14dbe0a..99b3e6f
+--- a/dual_camera.pro
++++ b/dual_camera.pro
+@@ -4,7 +4,7 @@
+ #
+ #-------------------------------------------------
+ 
+-QT       += core gui widgets
++QT       += core gui widgets platformsupport-private
+ 
+ lessThan(QT_MAJOR_VERSION, 4): QT += threads
+ 
+diff --git a/loopback.c b/loopback.c
+old mode 100644
+new mode 100755
+index 907b99b..80c6f84
+--- a/loopback.c
++++ b/loopback.c
+@@ -102,6 +102,8 @@ struct v4l2_device_info {
+ 	struct dmabuf_buffer **buffers;
+ } cap0_device, cap1_device;
+ 
++static volatile int dc_waiting_for_flip;
++
+ static struct omap_bo *alloc_bo(struct drm_device_info *device, unsigned int bpp,
+ 		unsigned int width, unsigned int height,
+ 		unsigned int *bo_handle, unsigned int *pitch)
+@@ -704,16 +706,23 @@ static void drm_restore_props(struct drm_device_info *device)
+ */
+ static int drm_init_device(struct drm_device_info *device)
+ {
+-	if (!device->fd) {
++	if ((!status.drm_fd) && (!device->fd)) {
+ 		device->fd = drmOpen("omapdrm", NULL);
+ 		if (device->fd < 0) {
+ 			ERROR("could not open drm device: %s (%d)", strerror(errno), errno);
+ 			return -1;
+ 		}
+ 	}
++    else
++    {
++        device->fd = status.drm_fd;
++	}
+ 
+-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
++    if (!status.drm_fd)
++    {
++	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
++	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 1);
++    }
+ 
+ 	device->dev = omap_device_new(device->fd);
+ 
+@@ -735,15 +744,17 @@ static int drm_init_device(struct drm_device_info *device)
+ static void drm_exit_device(struct drm_device_info *device)
+ {
+ 	drm_restore_props(device);
+-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
+-	drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 0);
++    if (!status.drm_fd)
++    {
++	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 0);
++	    drmSetClientCap(device->fd, DRM_CLIENT_CAP_ATOMIC, 0);
++    }
+ 
+ 	omap_device_del(device->dev);
+ 	device->dev = NULL;
+-	if (device->fd > 0) {
++	if ((!status.drm_fd) && (device->fd > 0)) {
+ 		close(device->fd);
+ 	}
+-
+ 	return;
+ }
+ 
+@@ -969,8 +980,6 @@ void set_plane_properties()
+ 	int ret;
+ 	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+ 
+-	req = drmModeAtomicAlloc();
+-
+ 	drmModeAtomicAddProperty(req, drm_device.plane_id[0],
+ 		drm_device.prop_fbid, drm_device.buf[status.main_cam][0]->fb_id);
+ 
+@@ -1110,83 +1119,144 @@ static void page_flip_handler(int fd, unsigned int frame,
+ 	*waiting_for_flip = 0;
+ }
+ 
++static void page_flip_handler_null(int fd, unsigned int frame,
++							       unsigned int sec, unsigned int usec,
++							       void *data)
++{
++
++}
++
+ /*
+ * Determines which camera feeds are being displayed and
+ * whether a jpeg image needs to be captured.
+ */
+ void process_frame(void)
+ {
+-	fd_set fds;
+-	int ret, waiting_for_flip = 1;
++	int ret;
+ 	struct dmabuf_buffer *buf[2] = {NULL, NULL};
+-	drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+-
+ 	struct v4l2_device_info *v4l2_device[2] =
+ 	{&cap0_device, &cap1_device};
+ 
+-	drmEventContext evctx = {
+-		.version = DRM_EVENT_CONTEXT_VERSION,
+-		.vblank_handler = 0,
+-		.page_flip_handler = page_flip_handler,
+-	};
+-
+-	/* Request a capture buffer from the driver that can be copied to */
+-	/* framebuffer */
+-	buf[status.main_cam] =
+-		v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
+-	drmModeAtomicAddProperty(req, drm_device.plane_id[0],
+-		drm_device.prop_fbid, buf[status.main_cam]->fb_id);
+-
+-	if (status.pip==true) {
+-		buf[!status.main_cam] =
+-			v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
+-		drmModeAtomicAddProperty(req, drm_device.plane_id[1],
+-			drm_device.prop_fbid, buf[!status.main_cam]->fb_id);
+-	}
+-
+-	ret = drmModeAtomicCommit(drm_device.fd, req,
+-		DRM_MODE_ATOMIC_TEST_ONLY, 0);
+-
+-	if(!ret){
+-		drmModeAtomicCommit(drm_device.fd, req,
+-			DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, &waiting_for_flip);
+-		}
+-		else {
+-		ERROR("failed to add plane atomically: %s", strerror(errno));
+-		}
+-
+-	drmModeAtomicFree(req);
+-
+-	/* Save jpeg image if triggered */
+-	if (status.jpeg==true) {
+-		capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
+-		status.jpeg=false;
+-		status.num_jpeg++;
+-		if (status.num_jpeg==10)
+-			status.num_jpeg=0;
+-	}
+-
+-	FD_ZERO(&fds);
+-	FD_SET(drm_device.fd, &fds);
+-
+-	while (waiting_for_flip) {
+-		ret = select(drm_device.fd + 1, &fds, NULL, NULL, NULL);
+-		if (ret < 0) {
+-			printf("select err: %s\n", strerror(errno));
+-			return;
+-		}
+-		else if (ret == 0) {
+-			printf("select timeout!\n");
+-			return;
+-		}
+-		else if (FD_ISSET(0, &fds)) {
+-			continue;
+-		}
+-		drmHandleEvent(drm_device.fd, &evctx);
+-	}
++    if (!status.drm_fd)
++    {
++        fd_set fds;
++	    drmModeAtomicReqPtr req = drmModeAtomicAlloc();
++
++	    drmEventContext evctx = {
++		    .version = DRM_EVENT_CONTEXT_VERSION,
++		    .vblank_handler = 0,
++		    .page_flip_handler = page_flip_handler,
++	    };
++
++	    /* Request a capture buffer from the driver that can be copied to */
++	    /* framebuffer */
++	    buf[status.main_cam] =
++		    v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
++	    drmModeAtomicAddProperty(req, drm_device.plane_id[0],
++		    drm_device.prop_fbid, buf[status.main_cam]->fb_id);
++
++	    if (status.pip==true) {
++		    buf[!status.main_cam] =
++			    v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
++		    drmModeAtomicAddProperty(req, drm_device.plane_id[1],
++			    drm_device.prop_fbid, buf[!status.main_cam]->fb_id);
++	    }
++
++	    ret = drmModeAtomicCommit(drm_device.fd, req,
++		    DRM_MODE_ATOMIC_TEST_ONLY, 0);
++
++	    if(!ret){
++            dc_waiting_for_flip = 1;
++		    drmModeAtomicCommit(drm_device.fd, req,
++			    DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, &dc_waiting_for_flip);
++		    }
++
++		    else {
++		    ERROR("failed to add plane atomically: %s", strerror(errno));
++		    }
++
++	    drmModeAtomicFree(req);
++
++	    /* Save jpeg image if triggered */
++	    if (status.jpeg==true) {
++		    capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
++		    status.jpeg=false;
++		    status.num_jpeg++;
++		    if (status.num_jpeg==10)
++			    status.num_jpeg=0;
++	    }
++
++	    FD_ZERO(&fds);
++	    FD_SET(drm_device.fd, &fds);
++
++	    while (dc_waiting_for_flip) {
++		    ret = select(drm_device.fd + 1, &fds, NULL, NULL, NULL);
++		    if (ret < 0) {
++			    printf("select err: %s\n", strerror(errno));
++			    return;
++		    }
++		    else if (ret == 0) {
++			    printf("select timeout!\n");
++			    return;
++		    }
++		    else if (FD_ISSET(0, &fds)) {
++			    continue;
++		    }
++		    drmHandleEvent(drm_device.fd, &evctx);
++	    }
++
++    }
++    else
++    {
++
++	    struct v4l2_device_info *v4l2_device[2] =
++	    {&cap0_device, &cap1_device};
++
++	    /* Request a capture buffer from the driver that can be copied to */
++	    /* framebuffer */
++	    buf[status.main_cam] =
++		    v4l2_dequeue_buffer(v4l2_device[status.main_cam]);
++
++        dc_waiting_for_flip = 1;
++
++        status.drm_plane_set_req_handler(drm_device.plane_id[0],
++                                         drm_device.prop_fbid,
++                                         buf[status.main_cam]->fb_id,
++                                         (status.pip==true)?page_flip_handler_null:
++                                                            page_flip_handler,
++                                         (void *)&dc_waiting_for_flip);
++                                         
++    	//MSG("process_frame: send event!");
++                                         
++
++	    if (status.pip==true) {
++		    buf[!status.main_cam] =
++			    v4l2_dequeue_buffer(v4l2_device[!status.main_cam]);
++
++            status.drm_plane_set_req_handler(drm_device.plane_id[1],
++                                             drm_device.prop_fbid,
++                                             buf[!status.main_cam]->fb_id,
++                                             page_flip_handler,
++                                             (void *)&dc_waiting_for_flip);
++	    }
++
++	    /* Save jpeg image if triggered */
++	    if (status.jpeg==true) {
++		    capture_frame(v4l2_device[status.main_cam], buf[status.main_cam]);
++		    status.jpeg=false;
++		    status.num_jpeg++;
++		    if (status.num_jpeg==10)
++			    status.num_jpeg=0;
++	    }
++
++	    while (dc_waiting_for_flip) {
++            usleep(1000);
++	    }
++    }
+ 
+ 	v4l2_queue_buffer(v4l2_device[status.main_cam], buf[status.main_cam]);
+ 	if(status.pip == true){
+ 		v4l2_queue_buffer(v4l2_device[!status.main_cam], buf[!status.main_cam]);
+ 	}
++
+ }
+diff --git a/loopback.h b/loopback.h
+index b5d384f..cb42f5b 100644
+--- a/loopback.h
++++ b/loopback.h
+@@ -5,6 +5,18 @@
+ extern "C" {
+ #endif
+ 
++typedef	void (*drm_page_flip_handler)(int fd,
++				                      unsigned int sequence,
++				                      unsigned int tv_sec,
++				                      unsigned int tv_usec,
++				                      void *user_data);
++
++typedef int  (*drm_plane_set_req)(uint32_t plane_id,
++                                  uint32_t prop_fbid,
++                                  uint32_t buffer_id,
++                                  drm_page_flip_handler handler,
++                                  void* user_data);
++
+ struct control {
+     unsigned int main_cam;
+     unsigned int num_cams;
+@@ -13,6 +25,8 @@ struct control {
+     bool pip;
+     bool jpeg;
+     bool exit;
++    int drm_fd;
++    drm_plane_set_req drm_plane_set_req_handler;
+ };
+ 
+ extern struct control status;
+diff --git a/main.cpp b/main.cpp
+index e73b061..011b1d7 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -1,5 +1,4 @@
+ #include <qglobal.h>
+-#include <QApplication>
+ #include <QLabel>
+ 
+ #if QT_VERSION < 0x050000
+@@ -13,7 +12,7 @@
+ int main(int argc, char *argv[])
+ {
+     QApplication a(argc, argv);
+-    MainWindow w;
++    MainWindow w(NULL, &a);
+ 
+ #if QT_VERSION < 0x050000
+ 	QWSServer::setBackground(QBrush(QColor(0, 0, 0, 0)));
+diff --git a/mainwindow.cpp b/mainwindow.cpp
+index d3608ba..2598d62 100644
+--- a/mainwindow.cpp
++++ b/mainwindow.cpp
+@@ -4,6 +4,7 @@
+ #include <QMutex>
+ #include "loopback.h"
+ #include <stdio.h>
++#include <qpa/qplatformnativeinterface.h>
+ 
+ class MyThread : public QThread
+ {
+@@ -16,13 +17,17 @@ protected:
+ MyThread* loopback;
+ QMutex drm_resource;
+ 
+-MainWindow::MainWindow(QWidget *parent) :
++MainWindow::MainWindow(QWidget *parent, QApplication* a) :
+ QMainWindow(parent),
+ ui(new Ui::MainWindow)
+ {
+ 	ui->setupUi(this);
+ 	this->setAttribute(Qt::WA_TranslucentBackground);
+-	this->setWindowFlags(Qt::FramelessWindowHint);
++	this->setWindowFlags(Qt::FramelessWindowHint);
++
++    platInf = a->platformNativeInterface();
++    status.drm_fd = (int) platInf->nativeResourceForIntegration("drm_fd");
++    status.drm_plane_set_req_handler = (drm_plane_set_req)platInf->nativeResourceForIntegration("drm_plane_set_req");
+ 
+ 	loopback = new MyThread();
+ 
+diff --git a/mainwindow.h b/mainwindow.h
+index fd81229..297ae25 100644
+--- a/mainwindow.h
++++ b/mainwindow.h
+@@ -1,6 +1,7 @@
+ #ifndef MAINWINDOW_H
+ #define MAINWINDOW_H
+ 
++#include <QApplication>
+ #include <QMainWindow>
+ 
+ namespace Ui {
+@@ -12,7 +13,7 @@ class MainWindow : public QMainWindow
+     Q_OBJECT
+     
+ public:
+-    explicit MainWindow(QWidget *parent = 0);
++    explicit MainWindow(QWidget *parent = 0, QApplication* a = NULL);
+     ~MainWindow();
+     
+ private slots:
+@@ -25,6 +26,7 @@ private slots:
+     void on_exit_clicked();
+ 
+ private:
++    QPlatformNativeInterface *platInf;
+     Ui::MainWindow *ui;
+ 
+ };
+-- 
+1.9.1
+
