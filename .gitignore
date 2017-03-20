@@ -40,3 +40,4 @@ CMakeLists.txt.user*
 dual_camera
 
 !ext_libs/*
+!Makefile.build
