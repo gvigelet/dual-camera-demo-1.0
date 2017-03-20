@@ -22,6 +22,7 @@
 moc_*.cpp
 qrc_*.cpp
 ui_*.h
+
 Makefile*
 *build-*
 
@@ -38,3 +39,5 @@ CMakeLists.txt.user*
 
 dual_camera
 
+!/ext_libs
+/ext_libs/*
