@@ -39,5 +39,4 @@ CMakeLists.txt.user*
 
 dual_camera
 
-!/ext_libs
-/ext_libs/*
+!ext_libs/*
